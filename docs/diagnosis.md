@@ -122,3 +122,40 @@ curl -s -o /dev/null -w "%{time_starttransfer}\n" "$BASE/common/css/topnetnew.cs
 curl -s "$BASE/common/js/topnet.js" | grep -c 'async *: *false'
 curl -s "$BASE/common/js/icpsp.js" | grep -c 'async *: *false'
 ```
+
+## 八、设立登记页（busiType=02）：链式加载 75 秒
+
+`entrance.action?busiType=02&nameId=...` 这个入口比名称申报重得多，实测时间线：
+
+| 阶段 | 累计耗时 | 单次耗时 |
+|---|---|---|
+| `entrance.action` 首字节 | 9.5s | 9516ms |
+| `ck.action` 会话检查 | 11.2s | 1513ms |
+| `refreshNavi.action` 返回 | 39.7s | **25685ms** |
+| `BaseInfo/viewRendering.action` 返回 | 74.9s | **35070ms** |
+| 表单可交互（63 个输入框） | **约 75s** | — |
+
+三个 `.action` 严格串行：`viewRendering` 的开始时间 39701ms 正好是 `refreshNavi` 结束的时刻，中间没有重叠。
+
+点「2. 人员信息」切换步骤，再触发一轮 `viewRendering.action`，耗时 **13201ms**。这个流程一共 12 个步骤（基本信息、人员信息、补充信息、多证合一、证照分离、上传材料、社保登记、税务信息填报、公积金、银行开户、刻制印章、水电气暖网报）。
+
+### 为什么这个页面会被误认为「完全卡死」
+
+浏览器渲染进程 CPU 0%、状态 S（睡眠）、CDP 的 `Runtime.evaluate` 和 `Page.captureScreenshot` 全部超时，看起来像整个标签页挂了。
+
+原因是 `topnet.js` 里的 `debugger;`：CDP 连接着的时候（DevTools 或自动化工具），执行到断点会暂停整个 renderer，主线程停摆，任何注入的脚本都跑不了。手动打开浏览器、不开 F12 时，只是慢，不会完全冻结。
+
+### 为什么缓存层帮不上
+
+`refreshNavi.action` 和 `viewRendering.action` 不在白名单里，实测 `hit: 0, miss: 0`，脚本全程没有介入。这两个请求是首屏渲染必需的，返回的是当前填写状态的 HTML 片段，缓存了会让人看到上一版表单。
+
+两个请求的业务参数几乎一致（`fromType`、`busiId`、`busiType`、`nameId`、`entType`、`uuid`），只有 `pinKey`/`pinVal` 签名不同。理论上可以并行发起省掉 25 秒，但签名算法在 `aes.js` + `md5.js` + `pad-zeropadding-min.js` 里，需要单独验证。
+
+## 九、复现命令
+
+```bash
+# 设立登记入口的时间线（需要登录态 cookie）
+curl -s -b "JSESSIONID=$SID" -o /dev/null \
+  -w 'ttfb:%{time_starttransfer} total:%{time_total}\n' \
+  "$BASE/entrance.action?fromType=______&busiType=02&nameId=$NAME_ID&uuid=$UUID&csrfToken=$TOKEN"
+```
